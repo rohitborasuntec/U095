@@ -29,7 +29,152 @@ class LetterProcessor:
         self.df = None
         self.temp_dir = "temp_docx"
         self.conversion_method = None  # Will be set after checking dependencies
-        
+
+    def extract_first_name(self,applicant_name):
+        """
+        Extract first name from applicant name.
+        Handles various name formats:
+        - "Mr P Steele" -> "Steele Household"
+        - "Mr. Chris Banks & Mrs. Claire Tyler" -> "Mr. Chris Banks & Mrs. Claire Tyler" (Joint)
+        - "Smith" -> "Smith Household"
+        - "R Smith" -> "Smith Household"
+        - "Mr Chris Banks" -> "Chris" (Individual)
+        - "Mr And Mrs Pinkham" -> "Mr And Mrs Pinkham" (Couple with only surname)
+        - "Mr & Mrs Hillcoat" -> "Mr & Mrs Hillcoat" (Couple with only surname)
+        - "Mr and Mrs Collins" -> "Mr and Mrs Collins" (Couple with only surname)
+        - "Mr & Mrs Taylor" -> "Mr & Mrs Taylor" (Couple with only surname)
+        - "Mr David McKenzie" -> "David McKenzie" (Two-part first name - Mc/Mac exception)
+        - "Mrs Yolanda Irais Ocon Andrew" -> "Yolanda Irais Ocon Andrew" (Multiple first names)
+        - "Tom Mc Gregor" -> "Tom Mc Gregor" (Surname with Mc)
+        - "Megan Ibbotson Ibbotson" -> "Megan Ibbotson Ibbotson" (Repeated surname)
+        """
+        if pd.isna(applicant_name) or str(applicant_name).strip() == '':
+            return 'Applicant'
+
+        name_str = str(applicant_name).strip()
+
+        # List of business/organisation names to keep as-is
+        businesses = [
+            "Nationwide Building Society",
+            "The Shere Surgery and Dispensary",
+            "Allianz",
+            "Owner"
+        ]
+
+        if name_str in businesses:
+            return name_str
+
+        # Check for "Mr & Mrs" or "Mr and Mrs" patterns (case insensitive)
+        mr_mrs_pattern = r'(?i)^(mr\s*&\s*mrs|mr\s+and\s+mrs)'
+        mr_mrs_match = re.match(mr_mrs_pattern, name_str)
+
+        if mr_mrs_match:
+            rest = name_str[mr_mrs_match.end():].strip()
+
+            if not rest:
+                return name_str
+
+            rest_parts = rest.split()
+
+            if '&' in rest or ' and ' in rest.lower():
+                return name_str
+
+            if len(rest_parts) >= 2:
+                first_word = rest_parts[0]
+                if len(first_word) > 2 and first_word[0].isupper() and first_word.isalpha():
+                    if len(rest_parts) == 2:
+                        return first_word
+                    else:
+                        return name_str
+                else:
+                    return name_str
+
+            return name_str
+
+        # Check for joint applicants with '&' or 'and'
+        if '&' in name_str or ' AND ' in name_str.upper():
+            return name_str
+
+        # Check for titles
+        titles = ['mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'sir', 'lord', 'lady', 'miss', 'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'rev.']
+        name_parts = name_str.split()
+
+        # Check if first part is a title
+        first_part_lower = name_parts[0].lower().replace('.', '')
+
+        if first_part_lower in titles:
+            # Has title - check the rest
+            if len(name_parts) == 1:
+                # Just title - return as-is
+                return name_str
+            else:
+                rest = ' '.join(name_parts[1:])
+                rest_parts = rest.split()
+
+                if len(rest_parts) == 0:
+                    return name_str
+                elif len(rest_parts) == 1:
+                    # Only surname
+                    surname = rest_parts[0].strip('.,')
+                    return f"{surname.capitalize()} Household"
+                else:
+                    # Check if first part of rest is an initial
+                    first_rest = rest_parts[0]
+                    if len(first_rest) <= 2 and (first_rest.isupper() or first_rest.endswith('.')):
+                        # It's an initial - surname takes precedence
+                        surname = rest_parts[-1].strip('.,')
+                        return f"{surname.capitalize()} Household"
+                    elif len(rest_parts) == 2:
+                        # Title + First name + Surname (e.g. "Mr Fraser Buttle" -> "Fraser")
+                        # Exception: Mc/Mac-prefixed surnames are treated as part of a
+                        # two-part first name and kept in full (e.g. "Mr David McKenzie")
+                        second_word = rest_parts[1]
+                        if second_word.startswith(('Mc', 'Mac', 'MC', 'MAC')):
+                            return ' '.join(rest_parts)
+                        return first_rest
+                    else:
+                        # 3+ parts - full first name(s) - return all parts after title
+                        # This handles "Yolanda Irais Ocon Andrew", "Tom Mc Gregor"
+                        return ' '.join(rest_parts)
+
+        # No title - handle other cases
+        if len(name_parts) == 1:
+            # Single name - it's a surname
+            return f"{name_str.capitalize()} Household"
+        elif len(name_parts) == 2:
+            # Two names - check if first is an initial
+            first_part = name_parts[0]
+            if len(first_part) <= 2 and (first_part.isupper() or first_part.endswith('.')):
+                # Initial + Surname
+                return f"{name_parts[1].capitalize()} Household"
+            else:
+                # First name + Surname
+                return name_parts[0]
+        else:
+            # Three or more names - likely has first and last name
+            # Check if first part is an initial
+            first_part = name_parts[0]
+            if len(first_part) <= 2 and (first_part.isupper() or first_part.endswith('.')):
+                # Initial + rest - surname takes precedence
+                return f"{name_parts[-1].capitalize()} Household"
+            else:
+                # Use all parts as first name(s)
+                # This handles "Megan Ibbotson Ibbotson" -> "Megan Ibbotson Ibbotson"
+                return ' '.join(name_parts)
+   
+    def process_names(self, names_list):
+        """
+        Process a list of names and return the fixed versions
+        """
+        results = []
+        for name in names_list:
+            fixed = self.extract_first_name(name)
+            results.append({
+                "original": name,
+                "modified": fixed
+            })
+        return results
+
     def load_excel(self):
         """Load the Excel file into a DataFrame."""
         self.df = pd.read_excel(self.excel_file_path)
@@ -69,19 +214,27 @@ class LetterProcessor:
     def format_address(self, address):
         """
         Format address with proper line breaks.
-        Example: "85 OPHIR ROAD, PORTSMOUTH, PO2 9ER"
-        becomes:
-        "85 OPHIR ROAD,\nPORTSMOUTH,\nPO2 9ER"
+        Also removes a comma directly after a leading house/plot number,
+        e.g. "38, Crowborough Drive, GORING, BN12 4UQ"
+        -> "38 Crowborough Drive, GORING, BN12 4UQ"
+        before line-breaking on the remaining commas.
         """
         if not address:
             return address
-        
+
+        address = str(address).strip()
+
+        # Remove a comma (and following spaces) right after a leading number
+        # e.g. "38, Crowborough Drive" -> "38 Crowborough Drive"
+        # also handles numbers with a letter suffix like "38A,"
+        address = re.sub(r'^(\d+[A-Za-z]?),\s*', r'\1 ', address)
+
         # Split by comma and strip whitespace
         parts = [part.strip() for part in address.split(',')]
-        
+
         # Join with newline
         return ',\n'.join(parts)
-    
+
     def generate_letter_one(self, reference, property_address, neighbour_address, docx_path):
         """
         Generate Letter One (Neighbour Letter) from the template.
@@ -112,6 +265,7 @@ class LetterProcessor:
         """
         Generate Letter Two (Applicant Letter) from the template.
         """
+        from xml.sax.saxutils import escape
         try:
             os.makedirs(os.path.dirname(docx_path), exist_ok=True)
             
@@ -120,11 +274,21 @@ class LetterProcessor:
             # Format address with proper line breaks (SAME AS LETTER ONE)
             property_address_formatted = self.format_address(property_address)
             
-            doc.render({
-                "Applicant_First_Name": applicant_first_name + ",",
-                "Reference": reference,
-                "address1": property_address_formatted,  # Property address with line breaks (NOW FORMATTED)
-            })
+            # Check if applicant_first_name contains "Household" or is a couple name
+            # If it contains "&" or "and", it's a couple - keep as-is
+            if '&' in applicant_first_name or ' and ' in applicant_first_name.lower():
+                doc.render({
+                    "Applicant_First_Name": escape(applicant_first_name) + ",",
+                    "Reference": escape(str(reference)),
+                    "address1": escape(property_address_formatted),
+                })
+            else:
+                # Otherwise, treat as individual
+                doc.render({
+                    "Applicant_First_Name": escape(applicant_first_name) + ",",
+                    "Reference": escape(str(reference)),
+                    "address1": escape(property_address_formatted),
+                })
             
             doc.save(docx_path)
             print(f"✅ Generated Letter Two DOCX: {os.path.basename(docx_path)}")
@@ -442,127 +606,7 @@ class LetterProcessor:
         except Exception as e:
             print(f"❌ Error processing applicant letter: {e}")
             return None
-    
-def extract_first_name(self, applicant_name):
-    """
-    Extract first name from applicant name.
-    Handles various name formats:
-    - "Mr P Steele" -> "Steele Household"
-    - "Mr. Chris Banks & Mrs. Claire Tyler" -> "Mr. Chris Banks & Mrs. Claire Tyler" (Joint)
-    - "Smith" -> "Smith Household"
-    - "R Smith" -> "Smith Household"
-    - "Mr Chris Banks" -> "Chris" (Individual)
-    - "Mr And Mrs Pinkham" -> "Mr And Mrs Pinkham" (Couple with only surname)
-    - "Mr & Mrs Hillcoat" -> "Mr & Mrs Hillcoat" (Couple with only surname)
-    - "Mr and Mrs Collins" -> "Mr and Mrs Collins" (Couple with only surname)
-    """
-    if pd.isna(applicant_name) or str(applicant_name).strip() == '':
-        return 'Applicant'
-    
-    name_str = str(applicant_name).strip()
-    
-    # List of business/organisation names to keep as-is
-    businesses = [
-        "Nationwide Building Society",
-        "The Shere Surgery and Dispensary",
-        "Allianz",
-        "Owner"
-    ]
-    
-    if name_str in businesses:
-        return name_str
-    
-    # Check for "Mr & Mrs" or "Mr and Mrs" patterns (case insensitive)
-    # This must be checked BEFORE the general '&' or 'and' detection
-    mr_mrs_pattern = r'(?i)^(mr\s*&\s*mrs|mr\s+and\s+mrs)'
-    mr_mrs_match = re.match(mr_mrs_pattern, name_str)
-    
-    if mr_mrs_match:
-        # Extract the rest after Mr & Mrs
-        rest = name_str[mr_mrs_match.end():].strip()
-        
-        # Check if rest contains first names (e.g., "Simon & Mary O'Brien" or "Joe and Gillian Allen")
-        # If there are 2 or more words after, or contains '&' or 'and', it has first names
-        rest_parts = rest.split()
-        
-        # Check for patterns like "Simon & Mary O'Brien" or "Joe and Gillian Allen"
-        if len(rest_parts) >= 3:  # e.g., "Simon & Mary O'Brien" has 3+ words
-            return name_str  # Keep full as-is
-        elif '&' in rest or ' and ' in rest.lower():
-            return name_str  # Keep full as-is
-        elif len(rest_parts) >= 2 and rest_parts[0][0].isupper() and rest_parts[1][0].isupper():
-            # Two capitalized words = first names (e.g., "Phil and Pam" or "Simon Mary")
-            # But check if it's actually a first and last name
-            # If it's only 2 words and both are capitalized, it could be "Joe Allen" (first + last)
-            # We'll keep it as-is to be safe
-            return name_str
-        else:
-            # Only surname - keep as "Mr & Mrs [Surname]" or "Mr and Mrs [Surname]"
-            # Normalize the "and" to "&" for consistency if needed
-            return name_str
-    
-    # Check for joint applicants with '&' or 'and' (but not Mr & Mrs pattern)
-    if '&' in name_str or ' AND ' in name_str.upper():
-        # Check if it has full names (e.g., "Charles and Amanda Yaxley")
-        # Keep full as-is
-        return name_str
-    
-    # Check for titles (Mr, Mrs, Miss, Ms, Dr, Rev, etc.)
-    titles = ['mr', 'mrs', 'ms', 'dr', 'prof', 'rev', 'sir', 'lord', 'lady', 'miss', 'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'rev.']
-    name_parts = name_str.split()
-    
-    # Check if first part is a title
-    first_part_lower = name_parts[0].lower().replace('.', '')
-    
-    if first_part_lower in titles:
-        # Has title - check the rest
-        if len(name_parts) == 1:
-            # Just title - return as-is
-            return name_str
-        else:
-            rest = ' '.join(name_parts[1:])
-            rest_parts = rest.split()
-            
-            if len(rest_parts) == 0:
-                return name_str
-            elif len(rest_parts) == 1:
-                # Only surname (e.g., "Mr Barfoot")
-                return f"{rest_parts[0]} Household"
-            else:
-                # Check if first part of rest is an initial (e.g., "P Steele")
-                first_rest = rest_parts[0]
-                if len(first_rest) <= 2 and (first_rest.isupper() or first_rest.endswith('.')):
-                    # It's an initial - surname takes precedence
-                    surname = rest_parts[-1].strip('.,')
-                    return f"{surname} Household"
-                else:
-                    # Full first name - use first name only (e.g., "Mr Chris Banks" -> "Chris")
-                    return rest_parts[0].strip('.,')
-    
-    # No title - handle other cases
-    if len(name_parts) == 1:
-        # Single name - it's a surname
-        return f"{name_str} Household"
-    elif len(name_parts) == 2:
-        # Two names - check if first is an initial
-        first_part = name_parts[0]
-        if len(first_part) <= 2 and (first_part.isupper() or first_part.endswith('.')):
-            # Initial + Surname (e.g., "R Smith")
-            return f"{name_parts[1]} Household"
-        else:
-            # First name + Surname (e.g., "Rebecca Clewley")
-            return name_parts[0].strip('.,')
-    else:
-        # Three or more names - likely has first and last name
-        # Check if first part is an initial
-        first_part = name_parts[0]
-        if len(first_part) <= 2 and (first_part.isupper() or first_part.endswith('.')):
-            # Initial + rest - surname takes precedence
-            return f"{name_parts[-1]} Household"
-        else:
-            # Use the first part as first name
-            return name_parts[0].strip('.,')
-    
+
     def process_row(self, row, output_dir, test_mode=True, process_letter_one=True, process_letter_two=True):
         """
         Process a single row from the DataFrame.
@@ -576,7 +620,7 @@ def extract_first_name(self, applicant_name):
         """
         reference = row['Reference']
         property_address = row['Address']
-        applicant_name = row.get('Letter Name', '')
+        applicant_name = row.get('Applicant Name', '')
         
         print(f"\n{'='*60}")
         print(f"📝 Processing {reference}")
@@ -681,9 +725,9 @@ def extract_first_name(self, applicant_name):
         list_of_index = [68,23,97,114,163,145,194,199,221,252,39]
         total_rows = len(self.df)
         for idx, row in self.df.iterrows():
+            print(f"\n📊 Processing row {idx + 1}/{total_rows}")
             if idx not in list_of_index:
                 continue
-            print(f"\n📊 Processing row {idx + 1}/{total_rows}")
             pdf_urls = self.process_row(row, output_dir, test_mode, process_letter_one, process_letter_two)
             
             # Update DataFrame with URLs
