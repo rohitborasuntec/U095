@@ -27,6 +27,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
     ElementClickInterceptedException,
+    InvalidSessionIdException,
 )
 
 # Import unified logger
@@ -38,9 +39,9 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATE_TO_EX = "29 Jun 2026"
-MAX_RETRIES_PER_ROW = 3
-MAX_PROXY_ATTEMPTS = 5
+DATE_TO_EX = "17 Aug 2026"
+MAX_RETRIES_PER_ROW = 1
+MAX_PROXY_ATTEMPTS = 1
 CHECKPOINT_EVERY = 5
 
 # Application types to filter
@@ -80,6 +81,163 @@ OUTPUT_DIR = Path("Output")
 for dir_path in [LOG_DIR, HTML_DEBUG_DIR, FAILED_HTML_DIR, LINK_HTML_DIR,
                  ZIP_DIR, PDF_DIR, TEMP_DIR, OUTPUT_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# BUSINESS EXCLUSION FILTER FUNCTION
+# ============================================================================
+
+def filter_business_applicants(df, applicant_name_column='Applicant Name'):
+    """
+    Apply business exclusion filter on applicant names.
+    Removes records where applicant name contains business keywords,
+    C/O Agent patterns, or is blank.
+    
+    Args:
+        df: DataFrame containing the scraped data
+        applicant_name_column: Name of the column containing applicant names
+        
+    Returns:
+        tuple: (filtered_df, removed_df)
+            - filtered_df: DataFrame with business applicants removed
+            - removed_df: DataFrame of removed business applicants with reasons
+    """
+    
+    # Comprehensive business exclusion keywords
+    business_keywords = {
+        'exact': [
+            'C/O Agent', 'c/o Agent', 'C/O', 'c/o',
+            'Consulting', 'Consultants', 'Consultancy',
+            'Services', 'Service',
+            'Development', 'Developments', 'Developer',
+            'School', 'Academy', 'College',
+            'Council', 'Councils',
+            'Church', 'Churches',
+            'Ltd', 'Limited', 'PLC', 'LLP', 'CIC',
+            'Group', 'Holdings', 'Holding',
+            'Partnership', 'Partners',
+            'Estates', 'Properties', 'Property',
+            'Company', 'Companies',
+            'Corporation', 'Incorporated', 'Inc',
+            'Associates', 'Association',
+            'Trading', 'Enterprises', 'Enterprise',
+            'Capital', 'Investments', 'Investment',
+            'Management', 'Managing',
+            'Solutions', 'Systems', 'Technologies',
+            'Designs', 'Design', 'Constructions', 'Construction',
+            'Builders', 'Building', 'Contractors', 'Contracting',
+            'Developers', 'Development'
+        ],
+        'patterns': [
+            r'c[/o][/\s]',  # Matches c/o, c/o, c/ o
+            r'c\s*/\s*o',    # Matches c / o
+            r'agent',        # Matches any form of agent
+            r'\(agent\)',    # Matches (agent)
+            r'\[agent\]'     # Matches [agent]
+        ]
+    }
+    
+    def get_removal_reason(name):
+        """
+        Determine why an applicant is being removed.
+        Returns a descriptive reason string.
+        """
+        if pd.isna(name) or str(name).strip() == '':
+            return 'Blank Applicant Name'
+        
+        name_str = str(name)
+        
+        # Check for C/O patterns
+        if re.search(r'c[/o][/\s]', name_str, re.IGNORECASE):
+            return 'C/O Agent - Business Representative'
+        if re.search(r'c\s*/\s*o', name_str, re.IGNORECASE):
+            return 'C/O Agent - Business Representative'
+        if re.search(r'agent', name_str, re.IGNORECASE):
+            return 'Contains "Agent"'
+        
+        # Check for exact matches and partial matches
+        name_lower = name_str.lower()
+        for keyword in business_keywords['exact']:
+            if keyword.lower() in name_lower:
+                return f'Contains "{keyword}"'
+        
+        # Check for additional patterns
+        for pattern in business_keywords['patterns']:
+            if re.search(pattern, name_str, re.IGNORECASE):
+                return 'Business Name Detected'
+        
+        return 'Business Name Detected'
+    
+    def is_business_applicant(name):
+        """
+        Check if an applicant name indicates a business.
+        Returns True if business, False if individual.
+        """
+        # Check for blank/null values
+        if pd.isna(name) or str(name).strip() == '':
+            return True
+        
+        name_str = str(name)
+        
+        # Quick check for C/O patterns (most common business indicator)
+        if re.search(r'c[/o][/\s]', name_str, re.IGNORECASE):
+            return True
+        if re.search(r'c\s*/\s*o', name_str, re.IGNORECASE):
+            return True
+        
+        # Check for agent references
+        if re.search(r'agent', name_str, re.IGNORECASE):
+            return True
+        
+        # Check for business keywords
+        name_lower = name_str.lower()
+        for keyword in business_keywords['exact']:
+            if keyword.lower() in name_lower:
+                return True
+        
+        # Check for additional patterns
+        for pattern in business_keywords['patterns']:
+            if re.search(pattern, name_str, re.IGNORECASE):
+                return True
+        
+        return False
+    
+    # Create a copy to avoid modifying original
+    df_copy = df.copy()
+    
+    # Apply business check
+    df_copy['Is_Business'] = df_copy[applicant_name_column].apply(is_business_applicant)
+    
+    # Split into filtered and removed
+    filtered_df = df_copy[~df_copy['Is_Business']].copy()
+    removed_df = df_copy[df_copy['Is_Business']].copy()
+    
+    # Add removal reason to removed records
+    if len(removed_df) > 0:
+        removed_df['Removal_Reason'] = removed_df[applicant_name_column].apply(get_removal_reason)
+    
+    # Remove temporary column from filtered data
+    filtered_df = filtered_df.drop('Is_Business', axis=1)
+    
+    # Remove temporary column from removed data
+    if 'Is_Business' in removed_df.columns:
+        removed_df = removed_df.drop('Is_Business', axis=1)
+    
+    # Log exclusions
+    if len(removed_df) > 0:
+        exclusion_log = Path("exclusion_list.csv")
+        is_new = not exclusion_log.exists()
+        removed_df[['Case Ref (internal)', 'Applicant Name', 'Removal_Reason']].to_csv(
+            exclusion_log, mode='a', header=is_new, index=False
+        )
+        logger.info(f"📋 Excluded {len(removed_df)} business applicants - logged to exclusion_list.csv")
+        for _, row in removed_df.iterrows():
+            logger.info(f"   EXCLUDED: {row.get('Case Ref (internal)', 'N/A')} - {row.get('Removal_Reason', 'Unknown')}")
+    
+    return filtered_df, removed_df
+
+# ============================================================================
+# END OF BUSINESS EXCLUSION FUNCTION
+# ============================================================================
 
 # ---------------------------------------------------------------------------
 # State Management
@@ -280,16 +438,17 @@ class CheckpointManager:
 # Browser Manager
 # ---------------------------------------------------------------------------
 class BrowserManager:
-    """Manage browser lifecycle with proxy support"""
+    """Manage browser lifecycle with proxy support and session recovery"""
     
     def __init__(self, download_dir: Path):
         self.driver = None
         self.download_dir = download_dir
         self.current_proxy = None
         self.use_proxy = False
+        self.session_healthy = False
     
     def _create_options(self, proxy: Optional[str] = None):
-        """Create Chrome options"""
+        """Create Chrome options - FIXED"""
         options = uc.ChromeOptions()
         
         # Download preferences
@@ -301,16 +460,25 @@ class BrowserManager:
         }
         options.add_experimental_option("prefs", prefs)
         
-        # Common arguments
+        # Common arguments - FIXED: Use add_argument for excludeSwitches
         options.add_argument("--disable-backgrounding-occluded-windows")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-background-timer-throttling")
-        options.add_argument("--no-sandbox")  # For Linux
-        options.add_argument("--disable-dev-shm-usage")  # For Linux
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        
+        # FIXED: Use add_argument instead of add_experimental_option for excludeSwitches
+        options.add_argument("--disable-blink-features=AutomationControlled")
         
         # User agent
-        from commons import user_agent_list
-        options.add_argument(f"--user-agent={random.choice(user_agent_list)}")
+        try:
+            from commons import user_agent_list
+            options.add_argument(f"--user-agent={random.choice(user_agent_list)}")
+        except:
+            # Fallback user agent
+            options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         
         # Proxy if provided
         if proxy:
@@ -364,59 +532,92 @@ class BrowserManager:
         return None
 
     def start(self, proxy: Optional[str] = None, headless: bool = False):
-        """Start browser with dynamic Chrome version detection"""
+        """Start browser with dynamic Chrome version detection - FIXED"""
         self.close()
         
+        # FIXED: Create fresh options each time
         options = self._create_options(proxy)
         self.current_proxy = proxy
         
         # Try to auto-detect Chrome version
         chrome_version = self._get_chrome_version()
         
-        if chrome_version:
-            logger.info(f"Detected Chrome version: {chrome_version}")
-            try:
-                self.driver = uc.Chrome(
-                    options=options,
-                    headless=headless,
-                    version_main=chrome_version
-                )
-                logger.info(f"Browser started with Chrome {chrome_version}")
-            except Exception as e:
-                logger.warning(f"Failed with detected version {chrome_version}: {e}")
-                # Fallback to auto-detection
+        try:
+            if chrome_version:
+                logger.info(f"Detected Chrome version: {chrome_version}")
+                try:
+                    # FIXED: Create new driver instance with fresh options
+                    self.driver = uc.Chrome(
+                        options=options,
+                        headless=headless,
+                        version_main=chrome_version
+                    )
+                    logger.info(f"Browser started with Chrome {chrome_version}")
+                except Exception as e:
+                    logger.warning(f"Failed with detected version {chrome_version}: {e}")
+                    # FALLBACK: Try without version specification
+                    try:
+                        # FIXED: Create fresh options for fallback
+                        options_fallback = self._create_options(proxy)
+                        self.driver = uc.Chrome(
+                            options=options_fallback,
+                            headless=headless
+                        )
+                        logger.info("Browser started with auto-detection (fallback)")
+                    except Exception as e2:
+                        logger.error(f"Fallback also failed: {e2}")
+                        # FINAL FALLBACK: Try with minimal options
+                        try:
+                            minimal_options = uc.ChromeOptions()
+                            minimal_options.add_argument("--no-sandbox")
+                            minimal_options.add_argument("--disable-dev-shm-usage")
+                            if proxy:
+                                minimal_options.add_argument(f'--proxy-server={proxy}')
+                            self.driver = uc.Chrome(
+                                options=minimal_options,
+                                headless=headless
+                            )
+                            logger.info("Browser started with minimal options")
+                        except Exception as e3:
+                            logger.error(f"Minimal options also failed: {e3}")
+                            self.session_healthy = False
+                            return False
+            else:
+                # No version detected, use auto-detection
                 try:
                     self.driver = uc.Chrome(
                         options=options,
                         headless=headless
                     )
                     logger.info("Browser started with auto-detection")
-                except Exception as e2:
-                    logger.error(f"Failed to start browser: {e2}")
+                except Exception as e:
+                    logger.error(f"Auto-detection failed: {e}")
+                    self.session_healthy = False
                     return False
-        else:
-            # No version detected, use auto-detection
-            try:
-                self.driver = uc.Chrome(
-                    options=options,
-                    headless=headless
-                )
-                logger.info("Browser started with auto-detection")
-            except Exception as e:
-                logger.error(f"Failed to start browser: {e}")
-                return False
+        except Exception as e:
+            logger.error(f"Failed to start browser: {e}")
+            self.session_healthy = False
+            return False
         
         # Set download behavior
-        self.driver.execute_cdp_cmd(
-            "Page.setDownloadBehavior",
-            {
-                "behavior": "allow",
-                "downloadPath": str(self.download_dir.resolve())
-            }
-        )
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": str(self.download_dir.resolve())
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to set download behavior: {e}")
         
-        self.driver.maximize_window()
-        self.driver.set_page_load_timeout(100)
+        try:
+            self.driver.maximize_window()
+            self.driver.set_page_load_timeout(100)
+        except Exception as e:
+            logger.warning(f"Failed to configure window: {e}")
+        
+        self.session_healthy = True
         logger.info("Browser configured successfully" + (f" with proxy: {proxy}" if proxy else ""))
         return True
 
@@ -429,12 +630,106 @@ class BrowserManager:
             except:
                 pass
             self.driver = None
+        self.session_healthy = False
     
     def restart_with_proxy(self, proxy: Optional[str] = None):
         """Restart browser with new proxy"""
         self.close()
-        time.sleep(2)
+        time.sleep(3)
         return self.start(proxy)
+    
+    def is_session_valid(self) -> bool:
+        """Check if the current browser session is still valid"""
+        if not self.driver:
+            self.session_healthy = False
+            return False
+        
+        try:
+            # Try a simple command to check session health
+            self.driver.current_url
+            self.session_healthy = True
+            return True
+        except InvalidSessionIdException:
+            self.session_healthy = False
+            logger.warning("Session invalid (InvalidSessionIdException)")
+            return False
+        except Exception as e:
+            error_str = str(e).lower()
+            if "invalid session id" in error_str or "no such window" in error_str:
+                self.session_healthy = False
+                logger.warning(f"Session invalid: {error_str[:100]}")
+                return False
+            # Other errors might be recoverable
+            self.session_healthy = True
+            return True
+    
+    def ensure_valid_session(self) -> bool:
+        """Ensure the browser session is valid, restart if needed"""
+        if not self.is_session_valid():
+            logger.info("Session invalid - restarting browser")
+            self.close()
+            time.sleep(3)
+            return self.start(self.current_proxy)
+        return True
+    
+    def safe_switch_to_window(self, window_index: int = 0, timeout: int = 10) -> bool:
+        """Safely switch to a window handle with retry"""
+        if not self.driver:
+            return False
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                handles = self.driver.window_handles
+                if window_index == -1 and handles:
+                    self.driver.switch_to.window(handles[-1])
+                    return True
+                elif window_index < len(handles):
+                    self.driver.switch_to.window(handles[window_index])
+                    return True
+            except InvalidSessionIdException:
+                self.session_healthy = False
+                return False
+            except Exception as e:
+                if "invalid session id" in str(e).lower():
+                    self.session_healthy = False
+                    return False
+                time.sleep(0.5)
+        return False
+    
+    def safe_close_tab(self) -> bool:
+        """Safely close current tab and switch to main"""
+        if not self.driver:
+            return False
+        
+        try:
+            handles = self.driver.window_handles
+            if len(handles) > 1:
+                self.driver.close()
+                time.sleep(0.5)
+                self.driver.switch_to.window(handles[0])
+                return True
+        except InvalidSessionIdException:
+            self.session_healthy = False
+            return False
+        except Exception as e:
+            if "invalid session id" in str(e).lower():
+                self.session_healthy = False
+                return False
+            logger.warning(f"Error closing tab: {e}")
+        return False
+    
+    def session_heartbeat(self) -> bool:
+        """Send a keep-alive command to prevent session timeout"""
+        if not self.driver:
+            return False
+        try:
+            if self.is_session_valid():
+                self.driver.execute_script("return 1;")
+                return True
+        except Exception:
+            pass
+        return False
     
     def __enter__(self):
         return self
@@ -453,13 +748,19 @@ def random_scroll(driver, min_scroll=200, max_scroll=800, min_pause=0.5, max_pau
     for _ in range(iterations):
         direction = 1 if random.random() < 0.8 else -1
         pixels = random.randint(min_scroll, max_scroll) * direction
-        driver.execute_script("window.scrollBy({top: arguments[0], behavior: 'smooth'});", pixels)
+        try:
+            driver.execute_script("window.scrollBy({top: arguments[0], behavior: 'smooth'});", pixels)
+        except:
+            pass
         time.sleep(random.uniform(min_pause, max_pause))
 
 def check_for_bot(driver):
     """Check if bot detection triggered"""
     time.sleep(random.randint(5, 8))
-    page_source = driver.page_source
+    try:
+        page_source = driver.page_source
+    except:
+        return False
     
     bot_indicators = [
         "One moment, we're checking you're not a bot.",
@@ -499,13 +800,22 @@ def safe_get(driver, url, wait_ready=True, timeout=20):
             return False
         raise
     
-    if driver.current_url.startswith("chrome-error://"):
-        logger.error(f"Chrome error page: {url}")
+    try:
+        if driver.current_url.startswith("chrome-error://"):
+            logger.error(f"Chrome error page: {url}")
+            return False
+    except:
         return False
     
+    check_for_bot(driver)
+    
     # Check for error pages
-    title = (driver.title or "").lower()
-    source = (driver.page_source or "").lower()
+    try:
+        title = (driver.title or "").lower()
+        source = (driver.page_source or "").lower()
+    except:
+        return False
+    
     error_strings = [
         "this site can't be reached", "err_name_not_resolved",
         "access denied", "service unavailable", "maintenance",
@@ -525,6 +835,8 @@ def safe_get(driver, url, wait_ready=True, timeout=20):
         except TimeoutException:
             logger.error(f"Document readyState timeout: {url}")
             return False
+        except:
+            return False
     
     return True
 
@@ -536,18 +848,27 @@ def safe_find(driver, by, value, timeout=10):
 
 def safe_click(driver, by, value, timeout=10):
     """Safe element click with retry"""
-    el = WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((by, value))
-    )
-    el.click()
-    return el
+    try:
+        el = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((by, value))
+        )
+        el.click()
+        return el
+    except Exception as e:
+        logger.warning(f"Click failed for {by}={value}: {e}")
+        raise
 
 def safe_select_by_text(driver, by, value, text, timeout=10):
     """Safe select dropdown by text"""
-    el = WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((by, value))
-    )
-    Select(el).select_by_visible_text(text)
+    try:
+        el = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((by, value))
+        )
+        Select(el).select_by_visible_text(text)
+        return True
+    except Exception as e:
+        logger.warning(f"Select failed for {by}={value}: {e}")
+        return False
 
 def handle_advanced_button(driver):
     """Handle browser advanced button for certificate errors"""
@@ -564,7 +885,7 @@ def handle_advanced_button(driver):
 # Main Scraper Class
 # ---------------------------------------------------------------------------
 class PlanningScraper:
-    """Main scraper class"""
+    """Main scraper class with session recovery"""
     
     def __init__(self, input_file: str = "Url.xlsx"):
         self.input_file = Path(input_file)
@@ -575,6 +896,8 @@ class PlanningScraper:
         self.html_debugger = HTMLDebugger()
         self.results = []
         self.processed_urls = set()
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5
         
         # App type counter
         self.app_type_count = {app: 0 for app in APPLICATION_TYPES}
@@ -582,7 +905,7 @@ class PlanningScraper:
         # Load input data
         self.df = self._load_input()
         self._load_previous_results()
-    
+        
     def _load_input(self) -> pd.DataFrame:
         """Load input Excel file"""
         if not self.input_file.exists():
@@ -592,13 +915,20 @@ class PlanningScraper:
         df = pd.read_excel(self.input_file)
         logger.info(f"Loaded {len(df)} rows from {self.input_file}")
         
-        # Add columns if not present
-        for col in ['Status', 'Start', 'Processed']:
-            if col not in df.columns:
-                df[col] = ''
+        # Add columns if not present - with proper dtypes
+        if 'Status' not in df.columns:
+            df['Status'] = ''  # String type
+        if 'Start' not in df.columns:
+            df['Start'] = ''   # String type
+        if 'Processed' not in df.columns:
+            df['Processed'] = ''  # String type
+        
+        # Ensure columns are string type to avoid dtype issues
+        df['Status'] = df['Status'].astype(str)
+        df['Start'] = df['Start'].astype(str)
+        df['Processed'] = df['Processed'].astype(str)
         
         return df
-    
     def _load_previous_results(self):
         """Load previous results if available"""
         temp_file = OUTPUT_DIR / "scraped_data_temp.csv"
@@ -693,10 +1023,33 @@ class PlanningScraper:
                     result[key] = driver.find_element(By.XPATH, xpath).text
             except:
                 result[key] = default
-        
-        # Check if applicant equals agent
         result["Applicant = Agent"] = result.get("Agent Name") == result.get("Applicant Name")
         
+        # ================================================================
+        # BUSINESS EXCLUSION CHECK
+        # ================================================================
+        # Check if applicant is a business and should be excluded
+        applicant_name = result.get("Applicant Name", "")
+        
+        # Create a temporary DataFrame row for the business check
+        temp_df = pd.DataFrame([{
+            'Applicant Name': applicant_name,
+            'Case Ref (internal)': case_ref
+        }])
+        
+        # Apply business filter
+        filtered_temp, removed_temp = filter_business_applicants(temp_df, 'Applicant Name')
+        
+        # If the applicant was removed (business), log and return None to skip
+        if len(removed_temp) > 0:
+            removal_reason = removed_temp.iloc[0].get('Removal_Reason', 'Business Exclusion')
+            logger.error(f"🚫 BUSINESS EXCLUSION: {case_ref} - {applicant_name} - {removal_reason}")
+            # Return None to indicate this should be skipped
+            return None
+        # ================================================================
+        # END OF BUSINESS EXCLUSION CHECK
+        # ================================================================
+        logger.info(f"Extracted data via Web: Applicant Name: {result.get('Applicant Name')}, Address: {result.get('Address')}")
         return result
     
     def _extract_via_pdf(self, pdf_path, case_ref=None):
@@ -758,7 +1111,7 @@ class PlanningScraper:
                 agent_match.group("surname").strip()
             ])
         
-        return {
+        result = {
             "Address": address.replace(ref_number, ""),
             "Applicant Name": applicant_name,
             "Agent Name": agent_name,
@@ -767,6 +1120,34 @@ class PlanningScraper:
             "Case Ref (internal)": case_ref,
             "Source File": str(pdf_path),
         }
+        
+        # ================================================================
+        # BUSINESS EXCLUSION CHECK
+        # ================================================================
+        # Check if applicant is a business and should be excluded
+        applicant_name_check = result.get("Applicant Name", "")
+        
+        # Create a temporary DataFrame row for the business check
+        temp_df = pd.DataFrame([{
+            'Applicant Name': applicant_name_check,
+            'Case Ref (internal)': case_ref
+        }])
+        
+        # Apply business filter
+        filtered_temp, removed_temp = filter_business_applicants(temp_df, 'Applicant Name')
+        
+        # If the applicant was removed (business), log and return None to skip
+        if len(removed_temp) > 0:
+            removal_reason = removed_temp.iloc[0].get('Removal_Reason', 'Business Exclusion')
+            logger.error(f"🚫 BUSINESS EXCLUSION: {case_ref} - {applicant_name_check} - {removal_reason}")
+            # Return None to indicate this should be skipped
+            return None
+        # ================================================================
+        # END OF BUSINESS EXCLUSION CHECK
+        # ================================================================
+        
+        logger.info(f"Extracted data for case {case_ref}: {result}")
+        return result
     
     def _download_and_extract(self, driver, pdf_name, case_ref=None):
         """Download and extract from application form"""
@@ -831,11 +1212,29 @@ class PlanningScraper:
         
         # Extract data from PDF
         item_ext = self._extract_via_pdf(final_path, case_ref=case_ref)
+        
+        # Check if business exclusion returned None (skip this record)
+        if item_ext is None:
+            logger.warning(f"Business exclusion triggered for {case_ref} - skipping")
+            # Clean up the PDF file
+            try:
+                final_path.unlink(missing_ok=True)
+            except:
+                pass
+            return None
+        
         item_ext["Pdf Link"] = pdf_link
         return item_ext
     
     def _process_link(self, driver, index: int, link_index: int, url: str) -> Dict:
         """Process a single link and return extracted data"""
+        
+        # --- SESSION VALIDATION ---
+        # Check session validity first
+        if not self.browser.is_session_valid():
+            logger.error(f"Invalid session before processing link {link_index}")
+            raise InvalidSessionIdException("Session invalid, need retry")
+        
         result = {
             "S.No.": link_index,
             "Url": "",
@@ -874,37 +1273,58 @@ class PlanningScraper:
             
             # Open in new tab
             element.send_keys(Keys.CONTROL + Keys.RETURN)
-            driver.switch_to.window(driver.window_handles[-1])
+            time.sleep(random.randint(5, 12))
+            
+            # --- SAFE WINDOW SWITCH ---
+            if not self.browser.safe_switch_to_window(-1):
+                logger.error(f"Failed to switch to new tab for {case_ref}")
+                raise InvalidSessionIdException("Failed to switch to new window")
             
             # Check for application summary
             if not driver.find_elements(By.XPATH, "//h1[contains(.,'Application Summary')]"):
                 logger.warning(f"No Application Summary for {case_ref}")
                 self.html_debugger.save_failed_page(driver, index, link_index, "no_summary")
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
+                self.browser.safe_close_tab()
+                time.sleep(random.randint(5, 8))
+                if not self.browser.safe_switch_to_window(0):
+                    raise InvalidSessionIdException("Failed to switch back to main window")
                 link_row["Status"] = "Failed"
                 return result
             
             check_for_bot(driver)
+
+            # driver.find_element(By.XPATH, "//h1[contains(.,'Application Summary')]").location_once_scrolled_into_view
             
             # Click information tab
-            safe_click(
-                driver,
-                By.XPATH,
-                "//span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-                "'abcdefghijklmnopqrstuvwxyz'), 'information')]"
-            )
+            try:
+                safe_click(
+                    driver,
+                    By.XPATH,
+                    "//span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                    "'abcdefghijklmnopqrstuvwxyz'), 'information')]"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to click information tab: {e}")
+                # Try alternative
+                try:
+                    driver.find_element(By.XPATH, "//a[@id='tab_information']").click()
+                except:
+                    pass
+            
             time.sleep(random.randint(5, 12))
             
             # Check application type
             app_type = ""
             for _ in range(5):
-                if driver.find_elements(By.XPATH, "//th[contains(text(),'Application Type')]"):
-                    app_type = driver.find_element(
-                        By.XPATH,
-                        "//th[contains(text(),'Application Type')]/following-sibling::td"
-                    ).text
-                    break
+                try:
+                    if driver.find_elements(By.XPATH, "//th[contains(text(),'Application Type')]"):
+                        app_type = driver.find_element(
+                            By.XPATH,
+                            "//th[contains(text(),'Application Type')]/following-sibling::td"
+                        ).text
+                        break
+                except:
+                    pass
                 time.sleep(random.randint(5, 15))
             
             if not app_type:
@@ -927,13 +1347,22 @@ class PlanningScraper:
             # Extract web data
             try:
                 web_data = self._extract_via_web(driver, case_ref=case_ref)
+                # Check if business exclusion returned None
+                if web_data is None:
+                    logger.warning(f"Business exclusion triggered for {case_ref} - skipping")
+                    link_row["Status"] = "Skipped - Business"
+                    self.browser.safe_close_tab()
+                    time.sleep(random.randint(5, 8))
+                    if not self.browser.safe_switch_to_window(0):
+                        raise InvalidSessionIdException("Failed to switch back to main window")
+                    return result
                 result.update(web_data)
                 link_row["Extracted"] = "Web Data"
             except Exception as e:
                 logger.error(f"Web extraction failed for {case_ref}: {e}")
                 link_row["Extracted"] = "Not Extracted"
             
-            self.app_type_count[app_type] += 1
+            self.app_type_count[app_type] = self.app_type_count.get(app_type, 0) + 1
             
             # Try to download PDF
             pdf_name = f"{index}_{link_index}_{int(time.time())}"
@@ -944,12 +1373,28 @@ class PlanningScraper:
                     "//a[@id='tab_documents']/span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
                     "'abcdefghijklmnopqrstuvwxyz'), 'document')]"
                 ):
-                    doc_link = safe_find(driver, By.XPATH, '//a[@id="tab_documents"]').get_attribute("href")
-                    safe_get(driver, doc_link)
-                    check_for_bot(driver)
+                    try:
+                        doc_link = safe_find(driver, By.XPATH, '//a[@id="tab_documents"]').get_attribute("href")
+                        if doc_link:
+                            if not safe_get(driver, doc_link):
+                                logger.warning(f"Failed to load documents page for {case_ref}")
+                            check_for_bot(driver)
+                        else:
+                            # Try clicking instead
+                            safe_click(driver, By.XPATH, '//a[@id="tab_documents"]')
+                    except Exception as e:
+                        logger.warning(f"Failed to navigate to documents: {e}")
                     
                     item_ext = self._download_and_extract(driver, pdf_name, case_ref=case_ref)
                     if item_ext:
+                        # Check if business exclusion returned None
+                        if item_ext is None:
+                            logger.warning(f"Business exclusion triggered in PDF for {case_ref} - skipping")
+                            link_row["Status"] = "Skipped - Business"
+                            self.browser.safe_close_tab()
+                            if not self.browser.safe_switch_to_window(0):
+                                raise InvalidSessionIdException("Failed to switch back to main window")
+                            return result
                         result.update({k: v for k, v in item_ext.items() if v})
                         link_row["PDF Data"] = "Extracted"
                         link_row["Status"] = "Completed"
@@ -959,11 +1404,18 @@ class PlanningScraper:
                     "//a[@id='tab_externalDocuments']/span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
                     "'abcdefghijklmnopqrstuvwxyz'), 'documents')]"
                 ):
-                    driver.find_element(
-                        By.XPATH,
-                        "//a[@id='tab_externalDocuments']/span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
-                        "'abcdefghijklmnopqrstuvwxyz'), 'documents')]"
-                    ).click()
+                    try:
+                        driver.find_element(
+                            By.XPATH,
+                            "//a[@id='tab_externalDocuments']/span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                            "'abcdefghijklmnopqrstuvwxyz'), 'documents')]"
+                        ).click()
+                    except:
+                        # Try the anchor
+                        try:
+                            driver.find_element(By.XPATH, '//a[@id="tab_externalDocuments"]').click()
+                        except:
+                            pass
                     time.sleep(random.randint(5, 8))
                     
                     # Process external documents
@@ -1017,6 +1469,14 @@ class PlanningScraper:
                             downloaded_path.unlink(missing_ok=True)
                             
                             item_ext = self._extract_via_pdf(final_path, case_ref=case_ref)
+                            # Check if business exclusion returned None
+                            if item_ext is None:
+                                logger.warning(f"Business exclusion triggered in PDF for {case_ref} - skipping")
+                                link_row["Status"] = "Skipped - Business"
+                                self.browser.safe_close_tab()
+                                if not self.browser.safe_switch_to_window(0):
+                                    raise InvalidSessionIdException("Failed to switch back to main window")
+                                return result
                             result.update({k: v for k, v in item_ext.items() if v})
                             link_row["PDF Data"] = "Extracted"
                             link_row["Status"] = "Completed"
@@ -1032,26 +1492,36 @@ class PlanningScraper:
                 link_row["PDF Data"] = "Not Extracted"
             
             # Close tab and switch back
-            if len(driver.window_handles) > 1:
-                driver.close()
-            driver.switch_to.window(driver.window_handles[0])
+            self.browser.safe_close_tab()
+            if not self.browser.safe_switch_to_window(0):
+                raise InvalidSessionIdException("Failed to switch back to main window")
             
             # Save HTML for debugging
-            self.html_debugger.save_link_page(driver, index, link_index)
+            try:
+                self.html_debugger.save_link_page(driver, index, link_index)
+            except:
+                pass
             
+        except InvalidSessionIdException:
+            # Re-raise for higher-level handling
+            raise
         except Exception as e:
             link_row["Status"] = "Failed"
             link_row["Error"] = str(e)
             logger.error(f"Link {link_index} failed: {e}")
-            self.html_debugger.save_failed_page(driver, index, link_index, str(e))
-            
-            if len(driver.window_handles) > 1:
-                try:
-                    driver.close()
-                except:
-                    pass
             try:
-                driver.switch_to.window(driver.window_handles[0])
+                self.html_debugger.save_failed_page(driver, index, link_index, str(e))
+            except:
+                pass
+            
+            # Try to clean up tabs
+            try:
+                self.browser.safe_close_tab()
+            except:
+                pass
+            try:
+                if not self.browser.safe_switch_to_window(0):
+                    pass
             except:
                 pass
         
@@ -1060,7 +1530,7 @@ class PlanningScraper:
         return result
     
     def _process_row(self, index: int, row: pd.Series) -> bool:
-        """Process a single row/website"""
+        """Process a single row/website with session recovery"""
         url = row["Url"]
         if "https://" not in url:
             url = "https://" + url
@@ -1089,33 +1559,22 @@ class PlanningScraper:
             logger.info(f"Attempt {attempt + 1}/{MAX_RETRIES_PER_ROW}")
             
             try:
-                # Start browser (no proxy for first attempt)
-                use_proxy = attempt > 0
-                if use_proxy:
-                    proxy = self.proxy_manager.get_next_proxy()
-                    if proxy:
-                        if not self.browser.restart_with_proxy(proxy):
-                            continue
-                    else:
-                        logger.warning("No proxy available, continuing without")
-                        if not self.browser.start():
-                            continue
-                else:
-                    if not self.browser.start():
-                        continue
-                
                 driver = self.browser.driver
                 
                 # Navigate to page
                 if not safe_get(driver, search_url):
                     logger.warning(f"Failed to load {search_url}")
-                    if use_proxy:
+                    if attempt > 0:
                         self.proxy_manager.attempts += 1
                         if self.proxy_manager.should_skip():
                             logger.info(f"Proxy attempts exhausted for {url}")
                             break
+                    # Restart browser for next attempt
+                    self.browser.close()
+                    time.sleep(3)
                     continue
                 
+                check_for_bot(driver)
                 # Handle advanced button
                 handle_advanced_button(driver)
                 
@@ -1136,73 +1595,151 @@ class PlanningScraper:
                 logger.debug("Search submitted")
                 
                 time.sleep(random.randint(3, 6))
+
+                if driver.find_elements(By.XPATH, "//li[contains(.,'No results found')]"):
+                    logger.warning(f"No results found for {url}")
+                    self.state.mark_url_completed(url)
+                    # FIXED: Convert datetime to string and ensure it can be stored
+                    self.df.at[index, 'Status'] = 'Completed - No Results'
+                    self.df.at[index, 'Processed'] = str(datetime.now().isoformat())
+                    return True
                 
                 # Set results per page
-                select_element = safe_find(driver, By.ID, 'resultsPerPage')
-                Select(select_element).select_by_value("100")
-                logger.debug("Results per page set to 100")
-                
-                safe_click(driver, By.XPATH, '//input[@value="Go"]')
-                time.sleep(random.randint(5, 8))
+                try:
+                    select_element = safe_find(driver, By.ID, 'resultsPerPage')
+                    Select(select_element).select_by_value("100")
+                    logger.debug("Results per page set to 100")
+                    
+                    safe_click(driver, By.XPATH, '//input[@value="Go"]')
+                    time.sleep(random.randint(5, 8))
+                except Exception as e:
+                    logger.warning(f"Failed to set results per page: {e}")
                 
                 # Save HTML for debugging
-                self.html_debugger.save_page(driver, LINK_HTML_DIR, f"row_{index}_listing")
+                try:
+                    self.html_debugger.save_page(driver, LINK_HTML_DIR, f"row_{index}_listing")
+                except:
+                    pass
                 
                 # Get all links
-                element_links = driver.find_elements(By.XPATH, '//li[@class="searchresult"]/a[not(@href="#")]')
-                total_links = len(element_links)
+                try:
+                    element_links = driver.find_elements(By.XPATH, '//li[@class="searchresult"]/a[not(@href="#")]')
+                    total_links = len(element_links)
+                except:
+                    logger.warning("Failed to get links, trying alternate selector")
+                    try:
+                        element_links = driver.find_elements(By.XPATH, '//li[contains(@class,"searchresult")]//a')
+                        total_links = len(element_links)
+                    except:
+                        total_links = 0
+                
                 logger.info(f"Found {total_links} links for {url}")
+
+                check_for_bot(driver)
+
+                if total_links == 0:
+                    logger.warning(f"No links found for {url}")
+                    self.state.mark_url_completed(url)
+                    # FIXED: Convert datetime to string
+                    self.df.at[index, 'Status'] = 'Completed - No Links'
+                    self.df.at[index, 'Processed'] = str(datetime.now().isoformat())
+                    return True
                 
                 # Process each link from start_index
                 success_count = 0
                 for link_idx in range(start_index, total_links):
                     logger.info(f"Processing link {link_idx + 1}/{total_links}")
                     
+                    # Heartbeat every 5 links
+                    if link_idx % 5 == 0:
+                        if not self.browser.session_heartbeat():
+                            logger.warning("Session heartbeat failed, restarting")
+                            raise InvalidSessionIdException("Session lost during processing")
+                    
                     # Process the link
-                    result = self._process_link(driver, index, link_idx, url)
+                    try:
+                        result = self._process_link(driver, index, link_idx, url)
+                        success_count += 1
+                        logger.info(f"Success Count {success_count}: Link {link_idx + 1} processed successfully")
+                        self.browser.safe_close_tab()
+                        time.sleep(random.randint(5, 8))
+                    except InvalidSessionIdException as e:
+                        logger.error(f"Session lost on link {link_idx}: {e}")
+                        # Save state and re-raise to trigger retry
+                        self.state.mark_url_partial(url, link_idx)
+                        self.checkpoint.save_temp(self.results)
+                        raise
                     
                     # Update state periodically
                     if (link_idx - start_index + 1) % CHECKPOINT_EVERY == 0:
                         self.state.mark_url_partial(url, link_idx + 1)
                         self.checkpoint.save_temp(self.results)
                     
-                    success_count += 1
+                    # Check session health periodically
+                    if (link_idx - start_index + 1) % 10 == 0:
+                        if not self.browser.is_session_valid():
+                            logger.warning("Session became invalid during processing")
+                            self.state.mark_url_partial(url, link_idx + 1)
+                            raise InvalidSessionIdException("Session lost")
                 
                 # All links processed
                 self.state.mark_url_completed(url)
+                # FIXED: Convert datetime to string
                 self.df.at[index, 'Status'] = 'Completed'
-                self.df.at[index, 'Processed'] = datetime.now().isoformat()
+                self.df.at[index, 'Processed'] = str(datetime.now().isoformat())
                 
                 # Save checkpoint
                 self.checkpoint.save_temp(self.results)
                 self.checkpoint.save_final(self.results)
                 
                 logger.info(f"Successfully processed {url}")
+                self.consecutive_failures = 0  # Reset failure counter
                 return True
                 
+            except InvalidSessionIdException as e:
+                logger.error(f"Session invalid on attempt {attempt + 1}: {e}")
+                self.browser.close()
+                time.sleep(5 * (attempt + 1))
+                continue
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1} failed for {url}: {e}")
                 logger.exception("Full traceback:")
                 
-                if self.browser.driver:
-                    self.html_debugger.save_failed_page(
-                        self.browser.driver, index, None, str(e)
-                    )
+                # FIXED: Save failed page with sanitized filename
+                try:
+                    if self.browser and self.browser.driver:
+                        # Sanitize error message for filename
+                        error_str = str(e).replace(':', '_').replace('/', '_').replace('\\', '_')
+                        error_str = error_str[:50] if len(error_str) > 50 else error_str
+                        self.html_debugger.save_failed_page(
+                            self.browser.driver, index, None, error_str
+                        )
+                except:
+                    pass
                 
                 # Check if it's a bot/rate limit issue
-                if self.browser.driver and "too many requests" in str(e).lower():
-                    logger.warning("Rate limit detected, restarting browser")
+                error_str = str(e).lower()
+                if "too many requests" in error_str or "rate limit" in error_str:
+                    logger.warning("Rate limit detected, waiting longer")
                     self.browser.close()
-                    time.sleep(random.randint(10, 20))
+                    time.sleep(random.randint(20, 40))
                 
-                # Try with proxy
+                # Check consecutive failures
+                self.consecutive_failures += 1
+                if self.consecutive_failures >= self.max_consecutive_failures:
+                    logger.error(f"Too many consecutive failures ({self.consecutive_failures}), waiting longer")
+                    time.sleep(30)
+                    self.consecutive_failures = 0
+                
+                self.browser.close()
+                
                 if attempt >= MAX_RETRIES_PER_ROW - 1:
                     self.state.mark_url_failed(url, str(e))
                     self.df.at[index, 'Status'] = 'Failed'
+                    self.df.at[index, 'Processed'] = str(datetime.now().isoformat())
                     return False
                 
                 time.sleep(5 * (attempt + 1))
-        
         return False
     
     def run(self):
@@ -1215,26 +1752,45 @@ class PlanningScraper:
             logger.error("No data to process")
             return
         
-        with BrowserManager(TEMP_DIR) as browser:
-            self.browser = browser
-            
+        # Initialize browser
+        self.browser = BrowserManager(TEMP_DIR)
+        if not self.browser.start():
+            logger.error("Failed to start initial browser")
+            return
+        
+        try:
             for index, row in self.df.iterrows():
                 # Skip already completed
                 if self.state.is_url_completed(row["Url"]):
                     logger.info(f"Skipping completed URL: {row['Url']}")
                     continue
                 
+                # Ensure valid session before processing row
+                if not self.browser.ensure_valid_session():
+                    logger.error("Failed to ensure valid session, skipping row")
+                    self.df.at[index, 'Status'] = 'Failed - Browser Error'
+                    self.df.to_excel(self.input_file, index=False)
+                    continue
+                
                 # Process row
                 success = self._process_row(index, row)
                 
                 # Save updated DataFrame
-                self.df.to_excel(self.input_file, index=False)
+                try:
+                    self.df.to_excel(self.input_file, index=False)
+                except Exception as e:
+                    logger.warning(f"Failed to save DataFrame: {e}")
                 
                 # Log final status
                 if success:
                     logger.info(f"Row {index} completed successfully")
                 else:
                     logger.error(f"Row {index} failed after all attempts")
+        
+        finally:
+            # Clean up
+            if self.browser:
+                self.browser.close()
         
         # Final save
         self.checkpoint.save_final(self.results)
@@ -1253,6 +1809,8 @@ if __name__ == "__main__":
     try:
         scraper = PlanningScraper("Url.xlsx")
         scraper.run()
+    except KeyboardInterrupt:
+        logger.info("Scraper interrupted by user")
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         logger.exception("Full traceback:")
